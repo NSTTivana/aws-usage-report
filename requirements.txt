@@ -1,0 +1,6 @@
+boto3==1.35
+botocore==1.35
+requests==2.32
+pytz==2024.2
+python-dotenv==1.1
+
