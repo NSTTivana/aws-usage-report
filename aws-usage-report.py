@@ -22,9 +22,9 @@ def send_to_discord_webhook(content, tenant_label, duration=None):
         print("Webhook URL not set.")
         return
     embed = {
-        "title": f"S3 Bucket Directory Size Report - {tenant_label}",
+        "title": f"S3 Bucket & Directory Size Report - {tenant_label}",
         "description": content,
-        "color": 3066993,
+        "color": 3066993, #green
         "footer": {"text": f"report {os.path.basename(__file__)} | Time Duration: {duration}"},
         "timestamp": datetime.now(pytz.timezone("Asia/Bangkok")).isoformat()
     }
@@ -36,6 +36,7 @@ def send_to_discord_webhook(content, tenant_label, duration=None):
     except requests.exceptions.RequestException as e:
         print(f"Failed to send webhook: {e}")
 
+## Prompt user for valid input with optional multi-select
 def get_valid_input(prompt, valid_options, allow_multiple=False):
     while True:
         user_input = input(prompt).strip().lower()
@@ -60,6 +61,7 @@ def setup_s3_client(zone_env, tenant_number):
         aws_secret_access_key=secret_key
     )
 
+# Generator that yields objects  bucket
 def get_bucket_objects(s3_client, bucket_name):
     paginator = s3_client.get_paginator('list_object_versions')
     for page in paginator.paginate(Bucket=bucket_name):
@@ -68,6 +70,7 @@ def get_bucket_objects(s3_client, bucket_name):
         for marker in page.get('DeleteMarkers', []):
             yield marker
 
+## List top-level directories from S3 keys
 def list_directories(objects):
     directories = set()
     for obj in objects:
@@ -75,6 +78,8 @@ def list_directories(objects):
         if len(parts) > 1:
             directories.add(parts[0])
     return sorted(directories)
+
+# Calculate total size and object count for selected directories
 
 def calculate_directory_sizes(objects, selected_dirs):
     result = {d: {'count': 0, 'size': 0} for d in selected_dirs}
@@ -87,6 +92,7 @@ def calculate_directory_sizes(objects, selected_dirs):
                 result[directory]['size'] += obj.get('Size', 0)
     return result
 
+# # Convert byte size 
 def format_size(size):
     kb = size / 1000
     mb = kb / 1000
@@ -102,9 +108,25 @@ def format_size(size):
         return f"{kb:.2f} KB"
     return f"{size} Bytes"
 
+# binaary to si human read units
+def parse_human_size(size_str):
+    size_str = size_str.strip().upper()
+    if size_str.endswith("TB"):
+        return int(float(size_str.replace("TB", "").strip()) * 1_000_000_000_000)
+    elif size_str.endswith("GB"):
+        return int(float(size_str.replace("GB", "").strip()) * 1_000_000_000)
+    elif size_str.endswith("MB"):
+        return int(float(size_str.replace("MB", "").strip()) * 1_000_000)
+    elif size_str.endswith("KB"):
+        return int(float(size_str.replace("KB", "").strip()) * 1_000)
+    else:
+        return int(float(size_str))
+
+
+#  Fetch and optionally cache S3 bucket objects dump pickle history cache
 def fetch_objects_for_bucket(s3_client, bucket_name, cached_objects, cache_file, save_cache):
     if bucket_name in cached_objects:
-        print(f"[CACHE] {bucket_name}")
+        print(f"[bug CACHE] {bucket_name}")
         return bucket_name, cached_objects[bucket_name]
     else:
         all_objects = list(get_bucket_objects(s3_client, bucket_name))
@@ -112,11 +134,12 @@ def fetch_objects_for_bucket(s3_client, bucket_name, cached_objects, cache_file,
         if save_cache:
             with open(cache_file, "wb") as f:
                 pickle.dump(cached_objects, f)
-        print(f"[FETCHED] {bucket_name}")
+        print(f"[beg FETCHED] {bucket_name}")
         return bucket_name, all_objects
 
 def main():
     parser = argparse.ArgumentParser(description="S3 Directory Size Reporter")
+    parser.add_argument('--skip', action='store_true', help='Skip tenant selection and summarize entire tenant usage')
     parser.add_argument('--all', action='store_true', help='Calculate all directories in each bucket')
     parser.add_argument('--all-buckets', action='store_true', help='Calculate all buckets without prompting')
     parser.add_argument('--no-cache', action='store_true', help='Do not save fetched data to cache')
@@ -154,7 +177,9 @@ def main():
             ak = os.getenv(f"S3_{zone}_TENANT{i}_ACCESS_KEY")
             sk = os.getenv(f"S3_{zone}_TENANT{i}_SECRET_KEY")
             if ak and sk:
-                all_tenants.append((zone, i, f"{zone}_TENANT{i}"))
+                label = f"{zone}_TENANT{i}"
+                tenant_no = os.getenv(f"S3_{zone}_TENANT{i}_NO", "")
+                all_tenants.append((zone, i, label, tenant_no))
                 i += 1
             else:
                 break
@@ -164,14 +189,14 @@ def main():
         return
 
     print("Select tenant:")
-    for idx, (_, _, label) in enumerate(all_tenants, 1):
-        print(f"{idx}. {label}")
+    for idx, (_, _, label, tenant_no) in enumerate(all_tenants, 1):
+        print(f"{idx}. {label} ({tenant_no})")
 
     tenant_input = get_valid_input(f"Enter tenant number (1-{len(all_tenants)}): ", [str(i) for i in range(1, len(all_tenants)+1)])
     if tenant_input == 'back':
         return
 
-    selected_zone, selected_tenant_num, tenant_label = all_tenants[int(tenant_input)-1]
+    selected_zone, selected_tenant_num, tenant_label, tenant_no = all_tenants[int(tenant_input)-1]
     s3_client = setup_s3_client(selected_zone, selected_tenant_num)
 
     try:
@@ -184,11 +209,11 @@ def main():
     if os.path.exists(cache_file) and os.path.getsize(cache_file) > 0:
         with open(cache_file, "rb") as f:
             cached_objects = pickle.load(f)
-            print("[DEBUG] Cache loaded")
+            print("[debugg] Cache loaded")
     else:
         cached_objects = {}
 
-    if args.all_buckets:
+    if args.all_buckets or args.skip:
         selected_buckets = buckets
     else:
         print("Available buckets:")
@@ -212,6 +237,48 @@ def main():
     bucket_objects_map = dict(results)
     grand_total_usage = 0
 
+    if args.all_buckets or args.skip:
+        start_time = time.time()
+        all_objects = []
+        for bucket in selected_buckets:
+            all_objects.extend(bucket_objects_map[bucket])
+        directories = list_directories(all_objects)
+        selected_dirs = directories
+        sizes = calculate_directory_sizes(all_objects, selected_dirs)
+        raw_total = sum(d['size'] for d in sizes.values())
+        total_files = sum(d['count'] for d in sizes.values())
+        grand_total_usage = raw_total
+
+        # ตรวจสอบ quota และคำนวณพื้นที่ที่เหลือ ถ้ามี
+        quota_str = os.getenv(f"S3_{selected_zone}_TENANT{selected_tenant_num}_QUOTA")
+
+        summary_embed = [
+            f"📦 Total Buckets: {len(selected_buckets)}"
+        ]
+        if show_total_files:
+            summary_embed.append(f"📄 Total Files: {total_files}")
+        if show_total_objects:
+            summary_embed.append(f"🔢 Total Objects: {total_files}")
+
+        if quota_str:
+            try:
+                quota = parse_human_size(quota_str)
+                remaining = quota - grand_total_usage
+                summary_embed.append(f"🧮 Total size: {format_size(raw_total)} ({raw_total} Bytes) / {format_size(quota)}")
+                summary_embed.append(f"📉 Remaining Space: {format_size(remaining)}")
+            except ValueError:
+                summary_embed.append("⚠️ Invalid QUOTA value in .env")
+        else:
+            summary_embed.append(f"🧮 Total size: {format_size(raw_total)} ({raw_total} Bytes) / unlimited")
+
+        output_text = "\n".join(summary_embed)
+        print(output_text)
+
+        if send_to_discord:
+            duration = str(datetime.fromtimestamp(time.time() - start_time, tz=timezone.utc).time())
+            send_to_discord_webhook(output_text, f"{tenant_label} #{tenant_no}", duration)
+        return
+
     for bucket in selected_buckets:
         start_time = time.time()
         print(f"📦 Bucket: {bucket}")
@@ -223,7 +290,7 @@ def main():
         for idx, d in enumerate(directories, 1):
             print(f"{idx}. {d}")
 
-        if args.all:
+        if args.all_buckets or args.all or args.skip:
             selected_dirs = directories
         else:
             dir_input = get_valid_input("Select directories (1,2,.. or '.' for all, 'b' to go back): ",
@@ -263,26 +330,24 @@ def main():
 
         if send_to_discord:
             duration = str(datetime.fromtimestamp(time.time() - start_time, tz=timezone.utc).time())
-            send_to_discord_webhook(output_text, tenant_label, duration)
+            send_to_discord_webhook(output_text, f"{tenant_label} #{tenant_no}", duration)
 
-    if args.all_buckets:
-        summary_text = f"S3 {tenant_label} total usage = {format_size(grand_total_usage)} ({grand_total_usage} Bytes)"
-        print(summary_text)
-        if send_to_discord:
-            summary_embed = [
-                f"total buckets: {len(selected_buckets)}"
-            ]
-            if show_total_files:
-                summary_embed.append(f"Total Files: {total_files}")
-            if show_total_objects:
-                summary_embed.append(f"Total objects: {total_files}")
-            summary_embed.append(f"Total size: {format_size(grand_total_usage)} ({grand_total_usage} Bytes)")
-            embed_text = "\n".join(summary_embed)
-            duration = str(datetime.fromtimestamp(time.time() - start_time, tz=timezone.utc).time())
-            send_to_discord_webhook(embed_text, tenant_label, duration)
+        if args.all_buckets or args.skip:
+            summary_text = f"S3 {tenant_label} total usage = {format_size(grand_total_usage)} ({grand_total_usage} Bytes)"
+            print(summary_text)
+            
+            if send_to_discord:
+                summary_embed = [
+                    f"📦 Total Buckets: {len(selected_buckets)}"
+                ]
+                if show_total_files:
+                    summary_embed.append(f"📄 Total Files: {total_files}")
+                if show_total_objects:
+                    summary_embed.append(f"🔢 Total Objects: {total_files}")
+                summary_embed.append(f"🧮 Total Size: {format_size(grand_total_usage)} ({grand_total_usage} Bytes)")
+                embed_text = "\n".join(summary_embed)
+                duration = str(datetime.fromtimestamp(time.time() - start_time, tz=timezone.utc).time())
+                send_to_discord_webhook(embed_text, f"{tenant_label} #{tenant_no}", duration)
 
 if __name__ == "__main__":
     main()
-
-
-###TEST
